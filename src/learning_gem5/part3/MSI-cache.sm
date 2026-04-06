@@ -84,6 +84,10 @@ machine(MachineType:L1Cache, "MSI cache")
         I,      AccessPermission:Invalid,
                     desc="Not present/Invalid";
 
+        // XXX(mfd) : Needed to distinguish between absent and invalidated.
+        SI_cached,  AccessPermission:Invalid,
+                desc="Was shared, invalidated, data retained for speculation";
+
         // States moving out of I
         IS_D,   AccessPermission:Invalid,
                     desc="Invalid, moving to S, waiting for data";
@@ -94,6 +98,9 @@ machine(MachineType:L1Cache, "MSI cache")
 
         S,      AccessPermission:Read_Only,
                     desc="Shared. Read-only, other caches may have the block";
+
+        IS_spec_D, AccessPermission:Read_Only,
+                    desc="Speculative shared, GetS sent, awaiting data to validate";
 
         // States moving out of S
         SM_AD,  AccessPermission:Read_Only,
@@ -155,6 +162,10 @@ machine(MachineType:L1Cache, "MSI cache")
     structure(Entry, desc="Cache entry", interface="AbstractCacheEntry") {
         State CacheState,        desc="cache state";
         DataBlock DataBlk,       desc="Data in the block";
+        bool Speculative,        desc="True if block holds speculative data";
+
+        int SpecOffset,  default=0,   desc="Byte offset of speculative load";
+        int SpecSize,    default=0,   desc="Size in bytes of speculative load";
     }
 
     // TBE is the "transaction buffer entry". This stores information needed
@@ -164,6 +175,15 @@ machine(MachineType:L1Cache, "MSI cache")
         State TBEState,         desc="State of block";
         DataBlock DataBlk,      desc="Data for the block. Needed for MI_A";
         int AcksOutstanding, default=0, desc="Number of acks left to receive.";
+
+        // DataBlock RetainedBlk,   desc="Data retained from before invalidation";
+        // bool HasRetained,        desc="True if RetainedBlk holds prior data";
+
+        // int SpecOffset,  default=0,   desc="Byte offset of speculative load";
+        // int SpecSize,    default=0,   desc="Size in bytes of speculative load";
+        // bool IsSpec,     default=false, desc="True if this TBE tracks a speculative access";
+
+        DataBlock IncomingDataBlk, desc="Real data arrived from directory, saved for logging";
     }
 
     // Table of TBE entries. This is defined externally in
@@ -235,8 +255,20 @@ machine(MachineType:L1Cache, "MSI cache")
     // This is also called when transitioning to I so it's possible the TBE and/
     // or the cache_entry is invalid.
     void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
-      if (is_valid(tbe)) { tbe.TBEState := state; }
-      if (is_valid(cache_entry)) { cache_entry.CacheState := state; }
+      if (is_valid(tbe)) {
+        tbe.TBEState := state;
+        if (tbe.TBEState == State:SI_cached || tbe.TBEState == State:IS_spec_D  ||
+            state == State:SI_cached || state == State:IS_spec_D) {
+            DPRINTF(RubyCache, "SCC: Transtion from %s to %s\n", tbe.TBEState, state);
+        }
+      }
+      if (is_valid(cache_entry)) {
+        if (state == State:SI_cached || cache_entry.CacheState == State:SI_cached ||
+            cache_entry.CacheState == State:IS_spec_D || state == State:IS_spec_D) {
+            DPRINTF(RubyCache, "SCC: Transtion from %s to %s\n", cache_entry.CacheState, state);
+        }
+        cache_entry.CacheState := state;
+      }
     }
 
     // Required function to override. Used for functional access to know where
@@ -345,6 +377,10 @@ machine(MachineType:L1Cache, "MSI cache")
                     // dir resp yet. So, if this is 0 we don't need to wait
                     assert(in_msg.Acks + tbe.AcksOutstanding >= 0);
                     if (in_msg.Acks + tbe.AcksOutstanding == 0) {
+                        if (tbe.TBEState == State:IS_spec_D) {
+                            // Save incoming data into TBE so actions can access it
+                            tbe.IncomingDataBlk := in_msg.DataBlk;
+                        }
                         trigger(Event:DataDirNoAcks, in_msg.addr, cache_entry,
                                 tbe);
                     } else {
@@ -356,6 +392,11 @@ machine(MachineType:L1Cache, "MSI cache")
                 } else {
                     // This is from another cache.
                     if (in_msg.Type == CoherenceResponseType:Data) {
+                        // TODO(mfd) : Refactor this as a function (don't know how exactly in SLICC)
+                        if (tbe.TBEState == State:IS_spec_D) {
+                            // Save incoming data into TBE so actions can access it
+                            tbe.IncomingDataBlk := in_msg.DataBlk;
+                        }
                         trigger(Event:DataOwner, in_msg.addr, cache_entry,
                                 tbe);
                     } else if (in_msg.Type == CoherenceResponseType:InvAck) {
@@ -394,6 +435,18 @@ machine(MachineType:L1Cache, "MSI cache")
                 } else if (in_msg.Type == CoherenceRequestType:GetM) {
                     trigger(Event:FwdGetM, in_msg.addr, cache_entry, tbe);
                 } else if (in_msg.Type == CoherenceRequestType:Inv) {
+                    if (is_valid(cache_entry)) {
+                        DPRINTF(RubyCache,
+                            "SCC: Inv received addr=%#x current_state=%s sender=%s\n",
+                            in_msg.addr,
+                            cache_entry.CacheState,
+                            in_msg.Requestor);
+                    } else {
+                        DPRINTF(RubyCache,
+                            "SCC: Inv received addr=%#x current_state=I (no entry) sender=%s\n",
+                            in_msg.addr,
+                            in_msg.Requestor);
+                    }
                     trigger(Event:Inv, in_msg.addr, cache_entry, tbe);
                 } else if (in_msg.Type == CoherenceRequestType:PutAck) {
                     trigger(Event:PutAck, in_msg.addr, cache_entry, tbe);
@@ -429,8 +482,20 @@ machine(MachineType:L1Cache, "MSI cache")
                     TBE victim_tbe := TBEs[addr];
                     trigger(Event:Replacement, addr, victim_entry, victim_tbe);
                 } else {
+                    // XXX(mfd) : Here Cache Entry is valid, we see if it is in the ready
+                    // to speculate state (SI_cached). If so we need to store the Physical
+                    // Address accessed because it will dissapear in the action section.
+                    // This means that we will allocate a TBE here, before the action.
+                    // TODO(mfd) : Later do the same thing for loads.
                     if (in_msg.Type == RubyRequestType:LD ||
                             in_msg.Type == RubyRequestType:IFETCH) {
+                        if (is_valid(cache_entry) && cache_entry.CacheState == State:SI_cached) {
+                            assert(is_invalid(tbe));
+                            cache_entry.SpecOffset := getOffset(in_msg.PhysicalAddress);
+                            cache_entry.SpecSize := in_msg.Size;
+                            DPRINTF(RubyCache, "SCC: saved spec info addr=%#x offset=%d size=%d\n",
+                                    in_msg.LineAddress, cache_entry.SpecOffset, cache_entry.SpecSize);
+                        }
                         trigger(Event:Load, in_msg.LineAddress, cache_entry,
                                 tbe);
                     } else if (in_msg.Type == RubyRequestType:ST) {
@@ -656,6 +721,10 @@ machine(MachineType:L1Cache, "MSI cache")
         set_tbe(TBEs[address]);
     }
 
+    action(assertValidTBE, "VT", desc="Assert Valid TBE") {
+        assert(is_valid(tbe));
+    }
+
     action(deallocateTBE, "dT", desc="Deallocate TBE") {
         assert(is_valid(tbe));
         TBEs.deallocate(address);
@@ -685,6 +754,19 @@ machine(MachineType:L1Cache, "MSI cache")
         // NOTE: There are other more complicated but higher performing stalls
         // in Ruby like recycle() or stall_and_wait.
         // z_stall stalls everything in the queue behind this request.
+    }
+
+    // XXX(mfd) : Special Action added just to log transitions involving the Speculated State
+    action(logSpecValidation, "lsv", desc="Log speculative validation result") {
+        assert(is_valid(tbe));
+        assert(is_valid(cache_entry));
+        // DPRINTF(RubyCache, "SCC_VALIDATE: addr=%#x speculated_data=%s incoming_data=%s\n", address, cache_entry.DataBlk, tbe.IncomingDataBlk);
+        DPRINTF(RubyCache, "SCC_VALIDATE: addr=%#x spec_offset=%d spec_size=%d\n", address, cache_entry.SpecOffset, cache_entry.SpecSize);
+        if (cache_entry.DataBlk.partialEqual(tbe.IncomingDataBlk, cache_entry.SpecOffset, cache_entry.SpecSize)) {
+            DPRINTF(RubyCache, "SCC_VALIDATE: addr=%#x MATCH\n", address);
+        } else {
+            DPRINTF(RubyCache, "SCC_VALIDATE: addr=%#x MISMATCH\n", address);
+        }
     }
 
 
@@ -769,6 +851,28 @@ machine(MachineType:L1Cache, "MSI cache")
         popMandatoryQueue;
     }
 
+    /* XXX(mfd) : This is very similar to the transtion above that happens upon normal hit,
+    However, there is some extra steps that we need to do. We need to sendGetS to the Directory
+    to get the real data.
+    We move to the speculative shared(read) state. */
+    transition(SI_cached, Load, IS_spec_D) {
+        loadHit;
+        allocateTBE; // did we deallocate the previous TBE.
+        // assertValidTBE;
+        sendGetS;
+        popMandatoryQueue;
+    }
+
+    /* XXX(mfd) : For now I do not deal with the Speculative Stores.
+    So I will do the same thing as if the cache line was invalid.*/
+    transition(SI_cached, Store, IM_AD) {
+        // In SI_cached, entry already exists
+        // allocateCacheBlock;
+        allocateTBE;
+        sendGetM;
+        popMandatoryQueue;
+    }
+
     transition(S, Store, SM_AD) {
         allocateTBE;
         sendGetM;
@@ -779,11 +883,48 @@ machine(MachineType:L1Cache, "MSI cache")
         sendPutS;
     }
 
+    /* XXX(mfd) : The transition here is deprecated and we need another state to distinguish between
+    cache blocks that are not present in the cache and those that are present but are invalidated.
+    As we see, in the original transition we deallocate the cache block and notify the CPU of the
+    evicted cache line
     transition(S, Inv, I) {
         sendInvAcktoReq;
         forwardEviction;
         deallocateCacheBlock;
         popForwardQueue;
+    }
+    */
+
+    /* XXX(mfd) : Send the Invalidation Ack so that the other CPU proceed. */
+    transition(S, Inv, SI_cached) {
+        sendInvAcktoReq;
+        // forwardEviction; DON'T TELL THE CPU
+        // deallocateCacheBlock; DON'T DEALLOCATE THE BLOCK
+        popForwardQueue;
+    }
+
+    /* XXX(mfd) : Need not tell the Directory that I am replacing this line because it already
+    thinks that I invalidated it. */
+    transition(SI_cached, Replacement, I) {
+        forwardEviction;
+        deallocateCacheBlock;
+        // popMandatoryQueue;
+    }
+
+    transition(IS_spec_D, {DataDirNoAcks, DataOwner}, S) {
+        // cache_entry holds the speculated data
+        // in_msg.DataBlk holds the read data from the directory
+        // for now we assume all speculations are correct.
+        // we override the data Entry
+        logSpecValidation;
+        writeDataToCache;
+        deallocateTBE;
+        popResponseQueue;
+    }
+
+    /* XXX(mfd): Same behaviour as IS_D*/
+    transition(IS_spec_D, {Load, Store, Replacement}) {
+        stall;
     }
 
     transition({SM_AD, SM_A}, {Store, Replacement, FwdGetS, FwdGetM}) {

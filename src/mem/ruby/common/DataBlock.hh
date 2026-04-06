@@ -88,6 +88,7 @@ class DataBlock
     void copyPartial(const DataBlock &dblk, const WriteMask &mask);
     void atomicPartial(const DataBlock & dblk, const WriteMask & mask);
     bool equal(const DataBlock& obj) const;
+    bool partialEqual(const DataBlock& obj, int offset, int len) const;
     void print(std::ostream& out) const;
 
   private:

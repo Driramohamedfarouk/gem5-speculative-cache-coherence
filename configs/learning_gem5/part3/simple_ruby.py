@@ -42,6 +42,8 @@ import m5
 
 # import all of the SimObjects
 from m5.objects import *
+import argparse
+import os
 
 # Needed for running C++ threads
 m5.util.addToPath("../../")
@@ -64,7 +66,8 @@ system.mem_mode = "timing"  # Use timing accesses
 system.mem_ranges = [AddrRange("512MB")]  # Create an address range
 
 # Create a pair of simple CPUs
-system.cpu = [X86TimingSimpleCPU() for i in range(2)]
+# XXX(mfd)_ : Need one more CPU for the main thread
+system.cpu = [X86TimingSimpleCPU() for i in range(5)]
 
 # Create a DDR3 memory controller and connect it to the membus
 system.mem_ctrl = MemCtrl()
@@ -81,24 +84,33 @@ system.caches.setup(system, system.cpu, [system.mem_ctrl])
 
 # Run application and use the compiled ISA to find the binary
 # grab the specific path to the binary
+"""
 thispath = os.path.dirname(os.path.realpath(__file__))
 binary = os.path.join(
     thispath,
     "../../../",
     "tests/test-progs/threads/bin/x86/linux/threads",
 )
+"""
+
+parser = argparse.ArgumentParser()
+parser.add_argument("binary", help="Path to the application binary")
+args = parser.parse_args()
+
 
 # Create a process for a simple "multi-threaded" application
 process = Process()
 # Set the command
 # cmd is a list which begins with the executable (like argv)
-process.cmd = [binary]
+process.cmd = [args.binary]
+
+system.workload = SEWorkload.init_compatible(args.binary)
 # Set the cpu to use the process as its workload and create thread contexts
 for cpu in system.cpu:
+    print("Creating a CPU")
     cpu.workload = process
     cpu.createThreads()
 
-system.workload = SEWorkload.init_compatible(binary)
 
 # Set up the pseudo file system for the threads function above
 config_filesystem(system)

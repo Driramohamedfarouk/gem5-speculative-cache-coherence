@@ -76,6 +76,14 @@ DataBlock::equal(const DataBlock& obj) const
     return !memcmp(m_data, obj.m_data, RubySystem::getBlockSizeBytes());
 }
 
+bool
+DataBlock::partialEqual(const DataBlock& obj, int offset, int len) const
+{
+    assert(offset >= 0);
+    assert(offset + len <= (int)RubySystem::getBlockSizeBytes());
+    return !memcmp(&m_data[offset], &obj.m_data[offset], len);
+}
+
 void
 DataBlock::copyPartial(const DataBlock &dblk, const WriteMask &mask)
 {
