@@ -126,6 +126,14 @@ class Sequencer : public RubyPort
                       const Cycles forwardRequestTime = Cycles(0),
                       const Cycles firstResponseTime = Cycles(0));
 
+    /**  XXX(mfd) : Another path analog to readCallback but will also save
+     * necessary information to check the speculation, which will be done
+     * in validateSpeculativeRead.
+    */
+    void speculativeReadCallback(Addr address, DataBlock& data);
+    void validateSpeculativeRead(Addr address, DataBlock& correct_data,
+                              bool matched);
+
     void unaddressedCallback(Addr unaddressedReqId,
                              RubyRequestType requestType,
                              const MachineType mach = MachineType_NUM,
@@ -225,6 +233,10 @@ class Sequencer : public RubyPort
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other
     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
+    // XXX(mfd) : A map that will hold speculative packets.
+    // This is because, hitCallback will assume they are done and will remove them.
+    // We don't want to change existing paths.
+    std::unordered_map<Addr, PacketPtr> m_speculativePkts;
 
     Cycles m_deadlock_threshold;
 

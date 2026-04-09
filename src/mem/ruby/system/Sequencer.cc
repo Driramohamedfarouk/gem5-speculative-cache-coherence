@@ -61,6 +61,8 @@
 #include "mem/ruby/system/RubySystem.hh"
 #include "sim/system.hh"
 
+#include "cpu/o3/lsq.hh"
+
 namespace gem5
 {
 
@@ -592,6 +594,78 @@ Sequencer::readCallback(Addr address, DataBlock& data,
     if (seq_req_list.empty()) {
         m_RequestTable.erase(address);
     }
+}
+
+void
+Sequencer::speculativeReadCallback(Addr address, DataBlock& data)
+{
+    assert(address == makeLineAddress(address));
+    auto &seq_req_list = m_RequestTable[address];
+   
+    // XXX(mfd) : Should contain just one ?
+    // assert(seq_req_list.size() == 1);
+    // Actually It can contain more than one request, these are requests
+    // that we have stalled in SLICC. But we will serve just one request
+    // and it should be a load request.
+    SequencerRequest &seq_req = seq_req_list.front();
+
+    PacketPtr pkt = seq_req.pkt;
+    // XXX(mfd) : Should only serve one speculative request at a time
+    assert(m_speculativePkts.find(address) == m_speculativePkts.end());
+    m_speculativePkts[address] = pkt;
+
+    recordMissLatency(&seq_req, true, MachineType_NUM, false,
+                      Cycles(0), Cycles(0), Cycles(0));
+    markRemoved();
+
+    o3::LSQ::LSQRequest *lsq_request = dynamic_cast<o3::LSQ::LSQRequest*>(pkt->senderState);
+
+    // std::cerr << "SCC : speculativeReadCallback Packet : \n" << pkt->print() << std::endl;
+    pkt->print();
+    
+    if (lsq_request != nullptr) {
+        std::cerr << "SCC : Instruction \n" << lsq_request->_inst << std::endl;
+    }
+
+    // std::cerr << lsq_request->packet << std::endl;
+
+    // The classic path uses hitCallback which may commit the load instruction.
+    // We need to somehow use another path, or propagate to hitCallback that
+    // this is speculative.
+    // We need a way to tell the CPU that the 
+    hitCallback(&seq_req, data, true, MachineType_NUM, false,
+                Cycles(0), Cycles(0), Cycles(0), false);
+
+    seq_req_list.pop_front();
+    if (seq_req_list.empty())
+        m_RequestTable.erase(address);
+}
+
+void
+Sequencer::validateSpeculativeRead(Addr address, DataBlock& correct_data,
+                              bool matched)
+{
+    Addr line_addr = makeLineAddress(address);
+    auto it = m_speculativePkts.find(line_addr);
+    assert(it != m_speculativePkts.end());
+    
+    PacketPtr pkt = it->second;
+    m_speculativePkts.erase(it);
+
+    // std::cerr << "SCC: validateSpeculativeRead: PacketPtr\n" << pkt->cmdString() << std::endl;
+    // std::cerr << "SCC: " << pkt->print() << std::endl;
+    // pkt->print();
+
+
+    if (matched) {
+        // DPRINTF(RubySequencer, "SCC: MATCH addr=%#x\n", address);
+        return;
+    }
+
+    // DPRINTF(RubySequencer, "SCC: MATCH addr=%#x\n", address);
+    // std::cerr << "SCC: Mismatch, need to squash but have no single idea, how" << std::endl;
+    // TODO(mfd) : generate stats of squashes.
+    return;
 }
 
 void

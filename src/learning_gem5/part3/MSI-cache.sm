@@ -151,6 +151,10 @@ machine(MachineType:L1Cache, "MSI cache")
 
         // Special internally triggered event to simplify implementation
         LastInvAck,     desc="Triggered after the last ack is received";
+
+        // Speculative coherence — validation results
+        DataDirNoAcks_Spec, desc="Data arrived, speculative load was correct";
+        DataDirNoAcks_Mismatch, desc="Data arrived, speculative load was wrong";
     }
 
     // A structure for the cache entry. This stores the cache data and state
@@ -380,6 +384,14 @@ machine(MachineType:L1Cache, "MSI cache")
                         if (tbe.TBEState == State:IS_spec_D) {
                             // Save incoming data into TBE so actions can access it
                             tbe.IncomingDataBlk := in_msg.DataBlk;
+                            // XXX(mfd) : Use different events to distinguish Match and Mismatch.
+                            // I'am having so much trouble trying to figure out how to pass the speculative information state to
+                            // the ROB.
+                            if (cache_entry.DataBlk.partialEqual(in_msg.DataBlk, cache_entry.SpecOffset, cache_entry.SpecSize)) {
+                                trigger(Event:DataDirNoAcks_Spec, in_msg.addr, cache_entry, tbe);
+                            } else {
+                               trigger(Event:DataDirNoAcks_Mismatch, in_msg.addr, cache_entry, tbe); 
+                            }
                         }
                         trigger(Event:DataDirNoAcks, in_msg.addr, cache_entry,
                                 tbe);
@@ -396,11 +408,18 @@ machine(MachineType:L1Cache, "MSI cache")
                         if (tbe.TBEState == State:IS_spec_D) {
                             // Save incoming data into TBE so actions can access it
                             tbe.IncomingDataBlk := in_msg.DataBlk;
+                            // Save incoming data into TBE so actions can access it
+                            tbe.IncomingDataBlk := in_msg.DataBlk;
+                            if (cache_entry.DataBlk.partialEqual(in_msg.DataBlk, cache_entry.SpecOffset, cache_entry.SpecSize)) {
+                                trigger(Event:DataDirNoAcks_Spec, in_msg.addr, cache_entry, tbe);
+                            } else {
+                               trigger(Event:DataDirNoAcks_Mismatch, in_msg.addr, cache_entry, tbe); 
+                            }
                         }
                         trigger(Event:DataOwner, in_msg.addr, cache_entry,
                                 tbe);
                     } else if (in_msg.Type == CoherenceResponseType:InvAck) {
-                        DPRINTF(RubySlicc, "Got inv ack. %d left\n",
+                        DPRINTF(RubyCache, "Got inv ack. %d left\n",
                                 tbe.AcksOutstanding);
                         if (tbe.AcksOutstanding == 1) {
                             // If there is exactly one ack remaining then we
@@ -656,6 +675,25 @@ machine(MachineType:L1Cache, "MSI cache")
         sequencer.readCallback(address, cache_entry.DataBlk, false);
     }
 
+    action(speculativeLoadHit, "sLh", desc="Speculative Load hit") {
+        DPRINTF(RubyCache, "SCC: speculativeLoadHit on address %#x\n", address);
+        assert(is_valid(cache_entry));
+        // Set this entry as the most recently used for the replacement policy
+        cacheMemory.setMRU(cache_entry);
+        // Send the data back to the sequencer/CPU. NOTE: False means it was
+        // not an "external hit", but hit in this local cache.
+        sequencer.speculativeReadCallback(address, cache_entry.DataBlk);
+    }
+
+    action(validateSpeculation, "vs", desc="Validate speculative load against real data") {
+        DPRINTF(RubyCache, "SCC: validateSpeculation on address %#x\n", address);
+        assert(is_valid(tbe));
+        bool matched := cache_entry.DataBlk.partialEqual(tbe.IncomingDataBlk, cache_entry.SpecOffset, cache_entry.SpecSize);
+        sequencer.validateSpeculativeRead(address, tbe.IncomingDataBlk, matched);
+    }
+
+
+
     action(externalLoadHit, "xLh", desc="External load hit (was a miss)") {
         assert(is_valid(cache_entry));
         peek(response_in, ResponseMsg) {
@@ -769,6 +807,34 @@ machine(MachineType:L1Cache, "MSI cache")
         }
     }
 
+    action(debug_stall, "ds", desc="Just debugging the stall") {
+        // I expect the entry to have a tbe and a cache_entry
+        assert(is_valid(tbe));
+        assert(is_valid(cache_entry));
+        DPRINTF(RubyCache, "SCC: Stall, received {Load|Store|Replacement} on a IS_spec_D addr=%#x\n", address);
+    }
+
+    action(log_stall_load, "sl", desc="Just debugging the stall") {
+        // I expect the entry to have a tbe and a cache_entry
+        assert(is_valid(tbe));
+        assert(is_valid(cache_entry));
+        DPRINTF(RubyCache, "SCC: Stall, received Load on a IS_spec_D addr=%#x\n", address);
+    }
+
+    action(log_stall_store, "ss", desc="Just debugging the stall") {
+        // I expect the entry to have a tbe and a cache_entry
+        assert(is_valid(tbe));
+        assert(is_valid(cache_entry));
+        DPRINTF(RubyCache, "SCC: Stall, received Store on a IS_spec_D addr=%#x\n", address);
+    }
+
+    
+    action(log_stall_replacement, "sr", desc="Just debugging the stall") {
+        // I expect the entry to have a tbe and a cache_entry
+        assert(is_valid(tbe));
+        assert(is_valid(cache_entry));
+        DPRINTF(RubyCache, "SCC: Stall, received Replacement on a IS_spec_D addr=%#x\n", address);
+    }
 
     /*************************************************************************/
     // These are the transition definition. These are simply each cell in the
@@ -856,11 +922,34 @@ machine(MachineType:L1Cache, "MSI cache")
     to get the real data.
     We move to the speculative shared(read) state. */
     transition(SI_cached, Load, IS_spec_D) {
-        loadHit;
+        // loadHit;
+        speculativeLoadHit;
         allocateTBE; // did we deallocate the previous TBE.
         // assertValidTBE;
         sendGetS;
         popMandatoryQueue;
+    }
+
+    /// XXX(mfd) : The only difference between this path and the hit path is that
+    /// we do not do a readCallback;
+    /// writeDataToCache is still necessary because although we have done a correct speculation
+    /// but still other parts of the cache line are changed and we need to get the up to data for correctness. 
+    transition(IS_spec_D, DataDirNoAcks_Spec, S) {
+        writeDataToCache;
+        // XXX(mfd) : Even if the speculation succeds I need to remove the speculated entry from the speculated state map.
+        // logSpecSuccess;
+        validateSpeculation;
+        deallocateTBE;
+        popResponseQueue;
+    }
+
+    transition(IS_spec_D, DataDirNoAcks_Mismatch, S) {
+        /// TODO(mfd) : Add logging.
+        writeDataToCache;
+        // logSpecSuccess;
+        validateSpeculation;
+        deallocateTBE;
+        popResponseQueue;
     }
 
     /* XXX(mfd) : For now I do not deal with the Speculative Stores.
@@ -923,7 +1012,25 @@ machine(MachineType:L1Cache, "MSI cache")
     }
 
     /* XXX(mfd): Same behaviour as IS_D*/
+    /* Decompose them just for debugging
     transition(IS_spec_D, {Load, Store, Replacement}) {
+        debug_stall;
+        stall;
+    }
+    */
+    
+    transition(IS_spec_D, Load) {
+        // log_stall_load;
+        stall;
+    }
+
+   transition(IS_spec_D, Store) {
+        log_stall_store;
+        stall;
+    }
+
+   transition(IS_spec_D, Replacement) {
+        log_stall_replacement;
         stall;
     }
 
