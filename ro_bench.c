@@ -8,7 +8,7 @@
 #define PAD 0
 #endif
 
-typedef struct
+typedef struct __attribute__((aligned(64)))
 {
     atomic_int hot_field;   // heavily updated
 #if PAD
@@ -24,7 +24,8 @@ atomic_bool stop_flag = ATOMIC_VAR_INIT(false);
 
 void* writer_thread(void* arg) {
     // const int N = 10000000ULL; // 10M
-    const int N = 1000000ULL; // 10M
+    fprintf(stderr, "[Writer] %#x", &shared);
+    const int N = 100000ULL; // 10M
     for (int i = 0; i < N && !atomic_load_explicit(&stop_flag, memory_order_relaxed); i++) {
         atomic_fetch_add_explicit(&shared.hot_field, 1, memory_order_relaxed);
     }
@@ -34,6 +35,7 @@ void* writer_thread(void* arg) {
 
 void* reader_thread(void* arg) {
     int sum = 0;
+    fprintf(stderr, "[Reader] %#x", &shared);
     while (!atomic_load_explicit(&stop_flag, memory_order_acquire)) {
         sum += atomic_load_explicit(&shared.ro_field, memory_order_relaxed);
     }

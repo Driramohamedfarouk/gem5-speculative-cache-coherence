@@ -490,6 +490,28 @@ class Commit
 
         /** Number of cycles where the commit bandwidth limit is reached. */
         statistics::Scalar commitEligibleSamples;
+
+        // ---- Speculative Cache Coherence (SCC) stats ----
+        
+        /** Number of distinct SCC loads that stalled at the ROB head. */
+        statistics::Scalar sccSpecLoads;
+
+        /** Number of SCC loads that resolved as a correct speculation. */
+        statistics::Scalar sccSpecCorrect;
+
+        /** Number of SCC loads that mismatched and triggered a squash. */
+        statistics::Scalar sccSpecMismatch;
+
+        /** Total cycles spent with an SCC load stalled at the ROB head. */
+        statistics::Scalar sccROBStallCycles;
+
+        /** Per-load stall duration histogram (cycles, bucket width 8). */
+        statistics::Distribution sccROBStallDist;
+
+        /** Mean stall duration per SCC load (derived: sccROBStallCycles / sccSpecLoads). */
+        statistics::Formula sccMeanROBStallCycles;
+
+        // ---- end SCC stats ----               
     } stats;
 };
 

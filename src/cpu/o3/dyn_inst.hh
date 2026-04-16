@@ -354,6 +354,14 @@ class DynInst : public ExecContext, public RefCounted
     ssize_t sqIdx = -1;
     typename LSQUnit::SQIterator sqIt;
 
+    /** Whether this is a speculative cache coherence instruction. */
+    bool isSpeculativeCacheCoherence = false;
+
+    /** Whether the speculation has been resolved. */
+    bool isSpeculationResolved = false;
+    
+    /** Whether the instruction was correctly speculated. */
+    bool isCorrectlySpeculated = false;
 
     /////////////////////// TLB Miss //////////////////////
     /**

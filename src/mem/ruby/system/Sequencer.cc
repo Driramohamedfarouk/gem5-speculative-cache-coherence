@@ -59,9 +59,11 @@
 #include "mem/ruby/slicc_interface/RubyRequest.hh"
 #include "mem/ruby/slicc_interface/RubySlicc_Util.hh"
 #include "mem/ruby/system/RubySystem.hh"
+#include "mem/ruby/system/Sequencer.hh"
 #include "sim/system.hh"
 
 #include "cpu/o3/lsq.hh"
+#include "cpu/o3/dyn_inst.hh"
 
 namespace gem5
 {
@@ -238,6 +240,30 @@ Sequencer::wakeup()
         for (const auto &seq_req : table_entry.second) {
             if (current_time - seq_req.issue_time < m_deadlock_threshold)
                 continue;
+
+            // DEADLOCK
+            for (auto& [addr, reqList] : m_RequestTable) {
+                for (auto& req : reqList) {
+                    DPRINTF(RubySequencer,
+                        "DEADLOCK_DUMP: addr=%#x type=%s issued=%llu speculative=%d\n",
+                        addr,
+                        RubyRequestType_to_string(req.m_type),
+                        req.issue_time,
+                        req.isSpeculativeRequest);
+                }
+            }
+            for (auto& [addr, pkt] : m_speculativePkts) {
+                DPRINTF(RubySequencer,
+                    "DEADLOCK_DUMP: specPkt addr=%#x\n", addr);
+            }
+            for (auto& [addr, inst] : m_speculativeInsts) {
+                DPRINTF(RubySequencer,
+                    "DEADLOCK_DUMP: specInst addr=%#x sn=%llu resolved=%d correct=%d\n",
+                    addr,
+                    inst->seqNum,
+                    inst->isSpeculationResolved,
+                    inst->isCorrectlySpeculated);
+            }
 
             panic("Possible Deadlock detected. Aborting!\n version: %d "
                   "request.paddr: 0x%x m_readRequestTable: %d current time: "
@@ -602,12 +628,9 @@ Sequencer::speculativeReadCallback(Addr address, DataBlock& data)
     assert(address == makeLineAddress(address));
     auto &seq_req_list = m_RequestTable[address];
    
-    // XXX(mfd) : Should contain just one ?
-    // assert(seq_req_list.size() == 1);
-    // Actually It can contain more than one request, these are requests
-    // that we have stalled in SLICC. But we will serve just one request
-    // and it should be a load request.
     SequencerRequest &seq_req = seq_req_list.front();
+
+    seq_req.isSpeculativeRequest = true;
 
     PacketPtr pkt = seq_req.pkt;
     // XXX(mfd) : Should only serve one speculative request at a time
@@ -618,16 +641,21 @@ Sequencer::speculativeReadCallback(Addr address, DataBlock& data)
                       Cycles(0), Cycles(0), Cycles(0));
     markRemoved();
 
-    o3::LSQ::LSQRequest *lsq_request = dynamic_cast<o3::LSQ::LSQRequest*>(pkt->senderState);
+    /// XXX(mfd) : It took me a lifetime to figure out this line that will allow me to access
+    ///  the instruction from the Sequencer.
+    o3::LSQ::LSQRequest *lsq_request = pkt->findNextSenderState<o3::LSQ::LSQRequest>();
 
-    // std::cerr << "SCC : speculativeReadCallback Packet : \n" << pkt->print() << std::endl;
-    pkt->print();
-    
     if (lsq_request != nullptr) {
-        std::cerr << "SCC : Instruction \n" << lsq_request->_inst << std::endl;
+        o3::DynInstPtr inst = lsq_request->_inst;
+        assert(inst->seqNum == pkt->req->getReqInstSeqNum());
+        inst->isSpeculativeCacheCoherence = true;
+        inst->isSpeculationResolved = false;
+        assert(m_speculativeInsts.find(address) == m_speculativeInsts.end());
+        m_speculativeInsts[address] = inst;
+    } else {
+        std::cerr << "SCC : No LSQ Request!!!!" << std::endl;
+        exit(1);
     }
-
-    // std::cerr << lsq_request->packet << std::endl;
 
     // The classic path uses hitCallback which may commit the load instruction.
     // We need to somehow use another path, or propagate to hitCallback that
@@ -652,18 +680,22 @@ Sequencer::validateSpeculativeRead(Addr address, DataBlock& correct_data,
     PacketPtr pkt = it->second;
     m_speculativePkts.erase(it);
 
-    // std::cerr << "SCC: validateSpeculativeRead: PacketPtr\n" << pkt->cmdString() << std::endl;
-    // std::cerr << "SCC: " << pkt->print() << std::endl;
-    // pkt->print();
 
+    auto inst_it = m_speculativeInsts.find(address);
+    assert(inst_it != m_speculativeInsts.end());
+    o3::DynInstPtr inst = inst_it->second;
 
+    assert(inst);
+
+    inst->isSpeculationResolved = true;
+    inst->isCorrectlySpeculated = matched;
+    m_speculativeInsts.erase(inst_it);
     if (matched) {
         // DPRINTF(RubySequencer, "SCC: MATCH addr=%#x\n", address);
         return;
     }
 
-    // DPRINTF(RubySequencer, "SCC: MATCH addr=%#x\n", address);
-    // std::cerr << "SCC: Mismatch, need to squash but have no single idea, how" << std::endl;
+    DPRINTF(RubySequencer, "SCC: INCORRECTLY speculated addr=%#x\n", address);
     // TODO(mfd) : generate stats of squashes.
     return;
 }

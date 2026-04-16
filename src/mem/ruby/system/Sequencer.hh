@@ -53,6 +53,8 @@
 #include "mem/ruby/system/RubyPort.hh"
 #include "params/RubySequencer.hh"
 
+#include "cpu/o3/dyn_inst_ptr.hh"
+
 namespace gem5
 {
 
@@ -65,6 +67,7 @@ struct SequencerRequest
     RubyRequestType m_type;
     RubyRequestType m_second_type;
     Cycles issue_time;
+    bool isSpeculativeRequest = false;
     SequencerRequest(PacketPtr _pkt, RubyRequestType _m_type,
                      RubyRequestType _m_second_type, Cycles _issue_time)
                 : pkt(_pkt), m_type(_m_type), m_second_type(_m_second_type),
@@ -78,6 +81,21 @@ struct SequencerRequest
         // expect to find
         assert(func_pkt->isWrite());
         return func_pkt->trySatisfyFunctional(pkt);
+    }
+
+    void dump()
+    {
+      std::cerr << "SequencerRequest dump : " << std::endl;
+      std::cerr << "m_type " << RubyRequestType_to_string(m_type) << std::endl;
+      std::cerr << "Speculative ? " << isSpeculativeRequest << std::endl;
+      std::cerr << "Packet : " << std::endl;
+      if (pkt != nullptr) {
+        pkt->print(std::cerr, 1, "SCC: ");
+        std::cerr << std::endl;
+      } else {
+        // XXX(mfd) : Is there any path on which this can happen ?
+        std::cerr << "Null Packet Pointer" << std::endl;
+      }
     }
 };
 
@@ -237,6 +255,8 @@ class Sequencer : public RubyPort
     // This is because, hitCallback will assume they are done and will remove them.
     // We don't want to change existing paths.
     std::unordered_map<Addr, PacketPtr> m_speculativePkts;
+    // XXX(mfd) : Store the instruction pointer of the speculated cache line address.
+    std::unordered_map<Addr, o3::DynInstPtr> m_speculativeInsts;
 
     Cycles m_deadlock_threshold;
 

@@ -165,13 +165,43 @@ Commit::CommitStats::CommitStats(CPU *cpu, Commit *commit)
       ADD_STAT(committedInstType, statistics::units::Count::get(),
                "Class of committed instruction"),
       ADD_STAT(commitEligibleSamples, statistics::units::Cycle::get(),
-               "number cycles where commit BW limit reached")
+      "number cycles where commit BW limit reached"),
+
+      ADD_STAT(sccSpecLoads, statistics::units::Count::get(),
+               "SCC: number of speculative cache coherence loads that reached ROB head"),
+      ADD_STAT(sccSpecCorrect, statistics::units::Count::get(),
+               "SCC: number of speculative loads validated correctly (no squash)"),
+      ADD_STAT(sccSpecMismatch, statistics::units::Count::get(),
+               "SCC: number of speculative loads that mismatched and were squashed"),
+      ADD_STAT(sccROBStallCycles, statistics::units::Cycle::get(),
+               "SCC: total cycles spent stalled at ROB head waiting for validation"),
+      ADD_STAT(sccROBStallDist, statistics::units::Cycle::get(),
+               "SCC: distribution of per-load ROB stall durations (cycles)"),
+      ADD_STAT(sccMeanROBStallCycles,
+               statistics::units::Rate<
+                   statistics::units::Cycle,
+                   statistics::units::Count>::get(),
+               "SCC: mean cycles a speculative load stalls at ROB head",
+               sccROBStallCycles / sccSpecLoads)
 {
     using namespace statistics;
 
     commitSquashedInsts.prereq(commitSquashedInsts);
     commitNonSpecStalls.prereq(commitNonSpecStalls);
     branchMispredicts.prereq(branchMispredicts);
+    
+    // SCC stats
+    sccSpecLoads.prereq(sccSpecLoads);
+    sccSpecCorrect.prereq(sccSpecCorrect);
+    sccSpecMismatch.prereq(sccSpecMismatch);
+    sccROBStallCycles.prereq(sccROBStallCycles);
+
+    // Histogram: buckets of 1 cycle wide, up to 512 cycles max.
+    // Covers the common coherence round-trip range; anything longer
+    // lands in the overflow bucket.
+    sccROBStallDist
+        .init(0, 512, 8)
+        .flags(statistics::pdf | statistics::cdf);
 
     numCommittedDist
         .init(0,commit->commitWidth,1)
@@ -1162,6 +1192,36 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         }
         // If this point is reached and the fault inherits from the HTM fault,
         // then there is no need to raise a new fault
+    }
+
+    // XXX(mfd) : Here is where we can check that the speculative Instruction can commit or not.
+    if (head_inst->isSpeculativeCacheCoherence) { 
+        if (!head_inst->isSpeculationResolved) {
+            // For now we only speculate on loads.
+            assert(head_inst->isLoad());
+            DPRINTF(Commit, "SCC: [tid:%i] [sn:%llu] Speculative load at ROB head, "
+                "waiting for validation.\n", tid, head_inst->seqNum);
+            // TODO(mfd) : Add stats to count how many times this happens.
+            // If the ratio of this happening is non-negligeable use a larger ROB.
+            ++stats.sccROBStallCycles;
+            return false;
+        } else {
+            // Speculation resolved
+            // I need to know whether it succeeded or not.
+            if (head_inst->isCorrectlySpeculated) {
+                // do nothing, It will commit on the path below.
+                DPRINTF(Commit, "SCC: [tid:%i] [sn:%llu] Speculative load resolved CORRECTLY\n", tid, head_inst->seqNum);
+                ++stats.sccSpecCorrect;
+            } else {
+                // incorrect speculation : need to squash.
+                DPRINTF(Commit, "SCC: [tid:%i] [sn:%llu] Speculative load resolved INCORRECTLY,"
+                    " squashing.\n", tid, head_inst->seqNum);
+
+                // XXX(mfd) : Piggyback on gem5 O3 squashing mechanism.
+                head_inst->fault = std::make_shared<ReExec>();
+                ++stats.sccSpecMismatch;
+            }
+        }
     }
 
     // Stores mark themselves as completed.

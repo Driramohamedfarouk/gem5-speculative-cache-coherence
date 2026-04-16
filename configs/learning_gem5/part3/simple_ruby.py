@@ -67,7 +67,7 @@ system.mem_ranges = [AddrRange("512MB")]  # Create an address range
 
 # Create a pair of simple CPUs
 # XXX(mfd)_ : Need one more CPU for the main thread
-system.cpu = [X86TimingSimpleCPU() for i in range(5)]
+system.cpu = [DerivO3CPU() for i in range(3)]
 
 # Create a DDR3 memory controller and connect it to the membus
 system.mem_ctrl = MemCtrl()

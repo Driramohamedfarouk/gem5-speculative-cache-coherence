@@ -377,7 +377,7 @@ class Request : public Extensible<Request>
         STICKY_PRIVATE_FLAGS = VALID_CONTEXT_ID
     };
 
-  private:
+  public:
 
     /**
      * The physical address of the request. Valid only if validPaddr
